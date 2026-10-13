@@ -5,6 +5,11 @@ import SocketManager from "./socketManager.js";
 import { parseQueryParams, buildRejoinPayload } from "./urlParser.js";
 
 const STORAGE_KEY = 'ttt.session';
+const REQUIRED_GAME_IMAGES = [
+  'assets/images/grid_background_ready.png',
+  'assets/images/x_symbol.png',
+  'assets/images/o_symbol.png',
+];
 
 class GameClient {
   constructor() {
@@ -28,6 +33,12 @@ class GameClient {
     this.selectedSymbolIndex = null; // The index of the piece to be moved
     this.readyState = 'not-ready'; // not-ready | sending | ready
     this.readyAction = null;
+    this.readyMode = null; // auto | manual | null
+    this.autoReadyFailed = false;
+    this.joinConfirmed = false;
+    this.requiredAssetsReady = false;
+    this.requiredAssetsPromise = null;
+    this.latestLobbyState = null;
     this.reconnectToken = null;
 
     let socketUrl;
@@ -56,12 +67,9 @@ class GameClient {
   }
 
   async init() {
-    // Audio preload is best-effort. Some embedded WebViews can leave media
-    // fetch/decode promises pending indefinitely; never let that block joining.
-    await Promise.race([
-      audioManager.init().catch(() => undefined),
-      new Promise((resolve) => setTimeout(resolve, 5000)),
-    ]);
+    // Audio remains best-effort and independent from gameplay readiness.
+    // Browser/WebView gesture restrictions must never block the Ready gate.
+    audioManager.init().catch(() => undefined);
     this.bindUIEvents();
 
     if (!this.params.joinUrl || !this.params.sessionId || !this.localPlayer.id || !this.localPlayer.name) {
@@ -78,11 +86,21 @@ class GameClient {
     }
 
     this.ui.showOverlay({
-      title: 'Connecting to Server',
-      message: 'Preparing your game...',
+      title: 'Preparing Game',
+      message: 'Loading required gameplay assets...',
       showSpinner: true,
     });
     this.ui.setBoardVisible(false);
+
+    // These visuals are mandatory gameplay assets. They can be fetched in
+    // parallel with the join handshake, but automatic Ready is not allowed
+    // until every one is actually loaded/decoded.
+    this.requiredAssetsPromise = this.prepareRequiredAssets()
+      .then(() => {
+        this.requiredAssetsReady = true;
+        this.maybeAutoReady();
+      })
+      .catch(() => {});
 
     try {
       await this.socketManager.connect();
@@ -118,7 +136,9 @@ class GameClient {
       if (joinResult && joinResult.reconnectToken) {
         this.reconnectToken = joinResult.reconnectToken;
       }
+      this.joinConfirmed = true;
       this.persistSession();
+      this.maybeAutoReady();
 
     } catch (error) {
       const reason = error?.message || 'Unknown error';
@@ -128,6 +148,39 @@ class GameClient {
         showSpinner: false,
       });
       this.broadcastEvent('CONNECTION_FAILED', { reason, source: 'init' });
+    }
+  }
+
+  async prepareRequiredAssets() {
+    await Promise.all(REQUIRED_GAME_IMAGES.map((src) => this.loadRequiredImage(src)));
+  }
+
+  async loadRequiredImage(src) {
+    for (;;) {
+      try {
+        const image = new Image();
+        image.decoding = 'async';
+        image.src = src;
+
+        await new Promise((resolve, reject) => {
+          if (image.complete) {
+            if (image.naturalWidth > 0) resolve();
+            else reject(new Error(`Failed to load ${src}`));
+            return;
+          }
+          image.addEventListener('load', resolve, { once: true });
+          image.addEventListener('error', () => reject(new Error(`Failed to load ${src}`)), { once: true });
+        });
+
+        if (typeof image.decode === 'function') {
+          await image.decode();
+        }
+        return;
+      } catch (error) {
+        // Required assets are not optional. Stay in Preparing Game and retry;
+        // do not manufacture Ready just because the network was temporarily slow.
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
     }
   }
 
@@ -173,6 +226,14 @@ class GameClient {
   }
 
   handleJoinError(payload) {
+    this.joinConfirmed = false;
+    if (this.readyAction) {
+      this.readyAction.cancel();
+      this.readyAction = null;
+    }
+    this.readyState = 'not-ready';
+    this.readyMode = null;
+    this.latestLobbyState = null;
     this.ui.showOverlay({
         title: "Could Not Join",
         message: payload.message || "An unknown error occurred.",
@@ -197,9 +258,21 @@ class GameClient {
     if (this.gameState === 'ended' || state.status === 'active') return;
 
     this.gameState = 'waiting';
+    this.latestLobbyState = state;
     const players = Array.isArray(state.players) ? state.players : [];
     const me = players.find((player) => player.playerId === this.localPlayer.id);
     const opponent = players.find((player) => player.playerId !== this.localPlayer.id);
+
+    // Never invent eligibility locally. Automatic Ready is possible only once
+    // the authoritative lobby state contains this authenticated player.
+    if (!me) {
+      this.ui.showOverlay({
+        title: 'Joining Game Session',
+        message: 'Confirming your player identity...',
+        showSpinner: true,
+      });
+      return;
+    }
 
     if (me?.ready) {
       this.readyState = 'ready';
@@ -221,26 +294,64 @@ class GameClient {
       return;
     }
 
-    if (me?.ready) {
+    if (me.ready) {
       this.ui.showOverlay({
-        title: 'You Are Ready',
-        message: opponent?.ready ? 'Starting game...' : 'Waiting for the other player to press Ready.',
+        title: 'Ready, Waiting for Other Players',
+        message: opponent?.ready ? 'Starting game...' : 'Ready confirmed by the server. Waiting for the other player.',
         showSpinner: !opponent?.ready,
       });
-    } else {
-      this.readyState = 'not-ready';
-      this.ui.showOverlay({
-        title: 'Ready to Play?',
-        message: opponent?.ready ? "Your opponent is ready. Press Ready when you're set. The game starts once everyone is ready." : "Press Ready when you're set. The game starts once everyone is ready.",
-        actionLabel: 'Ready',
-        actionHandler: () => this.handleReadyClick(),
-        showSpinner: false,
-      });
+      return;
     }
+
+    this.readyState = 'not-ready';
+
+    if (!this.joinConfirmed || !this.requiredAssetsReady) {
+      this.ui.showOverlay({
+        title: 'Preparing Game',
+        message: this.requiredAssetsReady
+          ? 'Confirming your game session...'
+          : 'Loading required gameplay assets...',
+        showSpinner: true,
+      });
+      return;
+    }
+
+    this.maybeAutoReady(state);
   }
 
-  handleReadyClick() {
-    if (this.readyState === 'ready' || this.readyState === 'sending' || !this.params.sessionId) return;
+  maybeAutoReady(state = this.latestLobbyState) {
+    if (this.gameState !== 'waiting'
+      || !this.joinConfirmed
+      || !this.requiredAssetsReady
+      || this.autoReadyFailed
+      || this.readyState !== 'not-ready'
+      || !state
+      || state.status !== 'pending') {
+      return;
+    }
+
+    const players = Array.isArray(state.players) ? state.players : [];
+    const me = players.find((player) => player.playerId === this.localPlayer.id);
+    const opponent = players.find((player) => player.playerId !== this.localPlayer.id);
+
+    if (!me || me.ready || !me.connected || !opponent || !opponent.connected) {
+      return;
+    }
+
+    this.handleReadyClick({ automatic: true });
+  }
+
+  handleReadyClick({ automatic = false } = {}) {
+    if (this.readyState === 'ready'
+      || this.readyState === 'sending'
+      || !this.params.sessionId
+      || !this.joinConfirmed
+      || !this.requiredAssetsReady) {
+      return;
+    }
+
+    if (!automatic) this.autoReadyFailed = false;
+    this.readyMode = automatic ? 'auto' : 'manual';
     this.readyState = 'sending';
     this.ui.showOverlay({
       title: 'Confirming Ready',
@@ -255,12 +366,17 @@ class GameClient {
       maxAttempts: 8,
       onExhausted: () => {
         if (this.readyState !== 'sending') return;
+        const automaticAttempt = this.readyMode === 'auto';
         this.readyState = 'not-ready';
         this.readyAction = null;
+        this.readyMode = null;
+        if (automaticAttempt) this.autoReadyFailed = true;
         this.ui.showOverlay({
           title: 'Ready Not Confirmed',
-          message: 'The server did not confirm your Ready status. Please try again.',
-          actionLabel: 'Try Again',
+          message: automaticAttempt
+            ? 'Automatic Ready could not be confirmed. Tap Ready to try again.'
+            : 'The server did not confirm your Ready status. Please try again.',
+          actionLabel: 'Ready',
           actionHandler: () => this.handleReadyClick(),
           showSpinner: false,
         });
@@ -271,27 +387,34 @@ class GameClient {
   handleReadyConfirmed({ playerId } = {}) {
     if (playerId !== this.localPlayer.id) return;
     this.readyState = 'ready';
+    this.readyMode = null;
+    this.autoReadyFailed = false;
     if (this.readyAction) {
       this.readyAction.cancel();
       this.readyAction = null;
     }
     this.ui.showOverlay({
-      title: 'You Are Ready',
-      message: 'Waiting for the other player to press Ready.',
+      title: 'Ready, Waiting for Other Players',
+      message: 'Ready confirmed by the server. Waiting for the other player.',
       showSpinner: true,
     });
   }
 
   handleReadyError(payload = {}) {
+    const automaticAttempt = this.readyMode === 'auto';
     this.readyState = 'not-ready';
+    this.readyMode = null;
+    if (automaticAttempt) this.autoReadyFailed = true;
     if (this.readyAction) {
       this.readyAction.cancel();
       this.readyAction = null;
     }
     this.ui.showOverlay({
       title: 'Ready Failed',
-      message: payload.message || 'Your Ready status could not be confirmed. Please try again.',
-      actionLabel: 'Try Again',
+      message: automaticAttempt
+        ? 'Automatic Ready could not be confirmed. Tap Ready to try again.'
+        : (payload.message || 'Your Ready status could not be confirmed. Please try again.'),
+      actionLabel: 'Ready',
       actionHandler: () => this.handleReadyClick(),
       showSpinner: false,
     });
@@ -319,6 +442,8 @@ class GameClient {
     const normalizedPlayers = this.normalizePlayers(session.players);
     this.gameState = 'playing';
     this.readyState = 'ready';
+    this.readyMode = null;
+    this.autoReadyFailed = false;
     if (this.readyAction) {
       this.readyAction.cancel();
       this.readyAction = null;
@@ -505,6 +630,17 @@ class GameClient {
         });
       }
     } else if (status === 'disconnected' || status === 'reconnecting') {
+      this.joinConfirmed = false;
+      if (this.gameState === 'waiting') {
+        if (this.readyAction) {
+          this.readyAction.cancel();
+          this.readyAction = null;
+        }
+        this.readyState = 'not-ready';
+        this.readyMode = null;
+        this.autoReadyFailed = false;
+        this.latestLobbyState = null;
+      }
       this.ui.setBoardVisible(false);
       this.ui.showOverlay({
         title: 'Connection Lost',
@@ -525,6 +661,7 @@ class GameClient {
   }
 
   async attemptRejoin() {
+    this.joinConfirmed = false;
     const cached = this.restoreSession();
     if (!cached) {
         this.ui.showOverlay({
@@ -556,6 +693,9 @@ class GameClient {
       if (joinResult && joinResult.reconnectToken) {
         this.reconnectToken = joinResult.reconnectToken;
       }
+      this.joinConfirmed = true;
+      this.persistSession();
+      this.maybeAutoReady();
     } catch (error) {
       const reason = error?.message || 'Connection failed';
       this.ui.showOverlay({
